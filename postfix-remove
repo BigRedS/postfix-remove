@@ -1,0 +1,199 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+my $opts = {};
+$opts->{'postsuper'} = "/usr/sbin/postsuper";
+$opts->{'postqueue'} = "/usr/sbin/postqueue";
+GetOptions(
+	"help|h"           => \$opts->{'help'},
+	"from-file=s"      => \$opts->{'f_queue'},
+	"from|f=s@"        => \$opts->{'from'},
+	"to|t=s@"          => \$opts->{'to'},
+	"reason|r=s@"      => \$opts->{'reason'},
+	"delete|d"         => \$opts->{'delete'},
+	"postsuper=s"      => \$opts->{'postsuper'},
+	"postqueue=s"      => \$opts->{'postqueue'},
+);
+
+if( !$opts->{'from'} && !$opts->{'to'} && !$opts->{'reason'} ){
+	$opts->{'help'}++;
+}
+
+if($opts->{'help'}){
+	print <<'EOF';
+postfix-remove
+
+Removes items from postfix's mailqueue.
+
+Usage:
+
+    postfix-remove [options]
+
+Options:
+
+    -h --help                Show this help
+    -d --delete              Actually remove mail (rather than show a count)
+       --from-file [path]    Don't use postqueue to read the live queue, read it from
+                             the file at [path]. Should have been created with something
+                             like `postqueue -p > [path]`
+    -f --from [pattern]      Select emails whose from address matches <pattern>
+    -t --to [pattern]        Select emails whose to address matches <pattern>
+    -r --reason [pattern]    Select emails whose reason for deferral matches <pattern>
+       --postqueue [path]    Path to postqueue (only if not at /usr/sbin/postqueue)
+       --postsuper [path]    Path to postsuper (only if not at /usr/sbin/postsuper)
+
+Matching is 'or' based, so adding more checks will delete *more* mail, not a smaller, 
+more specific subset. 'And' will be added in future.
+
+Patterns are perl regexes. ".com" will match any character followed by the three
+characters 'c', 'o', and 'm', but "\.com$" will only match those addresses ending
+with '.com'. Marching is case-insensitive.
+
+
+EOF
+	exit 0;
+}
+
+unless(-x $opts->{'postsuper'}){
+	print "ERROR: '$opts->{'postsuper'}' is not an executable file; is this a Postfix system? Are you root?\n";
+}
+
+unless(-x $opts->{'postqueue'}){
+	print "ERROR: '$opts->{'postqueue'}' is not an executable file; is this a Postfix system? Are you root?\n";
+}
+
+# Are we reading the queue by opening it, or operating ona file? Either way
+# get it into memory:
+my @queue;
+if($opts->{'f_queue'}){
+	if(-f $opts->{'f_queue'}){
+		my $fh;
+		eval{
+			open($fh, "<", $opts->{'f_queue'}) or die($!);
+		};
+		if($@){
+			print "Error opening queuefile '$opts->{'f_queue'}' : $@\n";
+			exit 1;
+		}
+		@queue = <$fh>;
+	}else{
+		print "Error opening queuefile '$opts->{'f_queue'} : File does not exist\n";
+		exit 1;
+	}
+}else{
+	@queue = qx/$opts->{'postqueue'} -p/;
+}
+
+
+
+# Matches is a hashref that stores stats on the efficacy of each supplied pattern.
+my $matches = {};
+# removeIDs is a hashref whose key is an ID to remove and value is the number of 
+# reasons to remove it (one per matching line of input, so 1-3)
+my $removeIDs = {};
+# queueID is Postfix's message ID.
+my $queueID;
+foreach my $line (@queue){
+	if($line =~ /^$/){
+		undef $queueID;
+		next;
+	}
+	if($line =~ /^(\w+)(\*|\!)?\s/){
+		$queueID = $1;
+	}
+	if($queueID){
+		if($line =~ /^$queueID/){
+			next unless($opts->{'from'});
+			# Queue ID | message size | Arrival datetime (4 fields) | Sender";
+			my $fromAddress = (split(/\s+/, $line))[-1];
+			if(my $myMatches = multimatch($fromAddress, $opts->{'from'})){
+				$matches->{'from'} = addHashrefs($matches->{'from'}, $myMatches);
+				$removeIDs->{$queueID}++;
+			}
+		}elsif($line =~ /^\s*\((.+)\)\s*$/){
+			my $reason = $1;
+			next unless($opts->{'reason'});
+			if(my $myMatches = multimatch($reason, $opts->{'reason'})){
+				$matches->{'reason'} = addHashrefs($matches->{'reason'}, $myMatches);
+				$removeIDs->{$queueID}++;
+			}
+		}elsif($line =~ /^\s*(\S+@\S+)\S*$/){
+			my $toAddress = $1;
+			next unless($opts->{'to'});
+			if(my $myMatches = multimatch($toAddress, $opts->{'to'})){
+				$matches->{'to'} = addHashrefs($matches->{'to'}, $myMatches);
+				$removeIDs->{$queueID}++;
+			}
+		}
+		
+	}
+
+}
+
+
+my $totalForDeletion = scalar( keys(%{$removeIDs}) );
+
+if($totalForDeletion == 0){
+	print "No messages matched; exiting\n";
+	exit 0;
+}
+
+my $longestPattern = 0;
+foreach my $infoLine (qw/to from reason/){
+	foreach my $pattern (@{$opts->{$infoLine}}){
+		$longestPattern = length($pattern) if length($pattern) > $longestPattern;
+	}
+}
+print "Pattern-matching statistics:\n";
+printf("  %-${longestPattern}s    %s\n", "Pattern", "Number of matched messages");
+foreach my $infoLine (qw/to from reason/){
+	print "$infoLine:\n";
+	foreach my $index (sort(keys(%{$matches->{$infoLine}}))){
+		printf("  %-${longestPattern}s    %d", ${$opts->{$infoLine}}[$index], $matches->{$infoLine}->{$index}+0);
+		print "\n";
+	}
+}
+
+
+
+if($opts->{'delete'}){
+ select STDOUT; $| = 1; 
+	open(my $fh_postsuper, "|$opts->{'postsuper'} -d -") or die ("Error opening postsuper : $!");
+	my $count = 0;
+	foreach(keys(%{$removeIDs})){
+		$count++;
+		printf ("Deleting message %-4d of %d\r", $count, $totalForDeletion);
+		print $fh_postsuper "$_\n";
+	}
+	close($fh_postsuper);
+	print "\n";
+}
+
+
+exit;
+
+
+sub addHashrefs{
+	my $bigHash = shift;
+	my $littleHash = shift;
+	foreach(keys(%{$littleHash})){
+		$bigHash->{$_}+=$littleHash->{$_};
+	}
+	return $bigHash;
+}
+
+sub multimatch{
+	my $haystack = shift;
+	my $needles = shift;
+	my $matches;
+	for(my $i = 0; $i<scalar( @{$needles} ); $i++){
+		if($haystack =~ /${$needles}[$i]/){
+			$matches->{$i}++;
+		}
+	}
+	return $matches;
+}
